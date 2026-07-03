@@ -830,6 +830,51 @@ class CameraWorker:
         """
         return self.is_running
 
+    def inference_stalled_for(self, now: float) -> float:
+        """Seconds since the last completed inference tick — gated on pending work.
+
+        Supervisor-facing health signal, used by ``Supervisor._worker_inference_dead``
+        to decide whether to restart the whole worker.  Two different accessors exist
+        deliberately: ``_inference_stall_age`` feeds the worker's own PTZ-stop
+        watchdog (a DIFFERENT consumer, gated on tracking being enabled — a stall
+        only matters there while auto PTZ would be driven), whereas this one feeds
+        an external process-health decision that must be correct regardless of
+        tracking state.  They are not interchangeable and should not be merged.
+
+        Critically, this is gated on there being a NEWER captured frame the
+        inference thread has not yet picked up (``_latest_frame_id !=
+        _current_inference_frame_id``). During a source outage (network/USB/NDI
+        drop) the capture loop keeps running and emitting telemetry but produces
+        no new frames, so the inference loop legitimately has nothing to do and
+        idles on ``_frame_ready`` — that is not a stalled/dead inference thread,
+        it is a healthy worker with no input, and must read as 0.0 here (the
+        capture thread's own reconnect backoff is what heals it). Only a frame
+        that is pending and NOT being consumed counts as a stall. Also gated on
+        ``_frames_inferred > 0`` (not a separate warmup constant) so a worker
+        still building its models on first start is never reported as stalled.
+        Reads ``_latest_frame_id`` under ``_frame_lock`` (written there by the
+        capture thread) for cross-thread consistency, matching how that field is
+        accessed everywhere else. Pure, side-effect free.
+        """
+        if self._frames_inferred <= 0:
+            return 0.0
+        with self._frame_lock:
+            latest_frame_id = self._latest_frame_id
+        if latest_frame_id == self._current_inference_frame_id:
+            # No new frame pending since inference last ran — nothing for the
+            # inference thread to be stuck on (source outage / idle camera).
+            return 0.0
+        return max(0.0, now - self._last_infer_t)
+
+    def inference_thread_alive(self) -> bool:
+        """True iff the inference thread object exists and is alive.
+
+        False before the capture thread has started it, after a clean stop, or
+        if it died/was never started successfully.
+        """
+        thread = self._inference_thread
+        return thread is not None and thread.is_alive()
+
     # ── command intake (thread-safe; called from supervisor/command pump) ────────
 
     def enable_tracking(self, enabled: bool) -> None:
