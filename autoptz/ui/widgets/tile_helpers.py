@@ -102,6 +102,117 @@ def _tracking_status(rec: Any) -> dict[str, Any]:
         return {}
 
 
+def _quality_state(rec: Any) -> dict[str, Any]:
+    try:
+        return rec.quality_state_as_dict()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+# Engine ``tracking_status`` -> state-chip vocabulary.
+#
+# The full literal ``state`` set emitted by ``_tracking_status_info``
+# (autoptz/engine/camera_worker.py) is exactly: idle, manual, degraded,
+# ambiguous, locked, coasting, searching, standby. ``locked`` and ``standby``
+# each carry two ``action`` flavors that mean different things to an operator
+# even though the ``state`` string is identical, so the chip keys off
+# ``(state, action)`` rather than ``state`` alone:
+#
+#   locked + action="tracking" -> camera IS actively following (severity=ok)
+#   locked + action="paused"   -> target selected, auto-tracking OFF (severity=info)
+#   standby + action="confirming" -> fresh target pick, awaiting ID confirm (info)
+#   standby + action="standby"    -> coast window elapsed, waiting to reacquire (info)
+#
+# Colors are derived from the engine's own ``severity`` field (never a second
+# hand-maintained severity table): ok -> green, warning -> amber, info ->
+# neutral/gray. The one override is locked+paused, which is ``severity=info``
+# but must NOT read as "green tracking" or "red/alarming" — it's a deliberate
+# operator choice, not a problem. Nothing here renders red: the engine never
+# emits ``severity="error"`` from this function, and there is no literal
+# "lost" state (only an internal ``_target_lock.status`` value that always
+# falls through to the "standby" states above). An unrecognized future state
+# must fail safe to the neutral color, never red/alarming.
+_SEVERITY_COLOR_KEY = {
+    "ok": "locked",
+    "warning": "warning",
+    "info": "neutral",
+}
+
+_STATE_CHIP_TEXT = {
+    "locked": "LOCKED",
+    "coasting": "COASTING",
+    "searching": "SEARCHING",
+    "ambiguous": "AMBIGUOUS",
+    "manual": "MANUAL",
+    "degraded": "DEGRADED",
+    "standby": "STANDBY",
+}
+
+
+def _state_chip_info(rec: Any) -> dict[str, Any]:
+    """Resolve the tile's tracking-state chip: ``{visible, text, color_key}``.
+
+    Hidden whenever tracking isn't enabled for this camera (nothing to show)
+    or the engine reports "idle" (no target set yet) — matching the project
+    rule that chips are unconditional truth, not a toggleable feature.
+
+    Color is derived from the engine's own ``severity`` field, with a single
+    explicit override for the "target selected but not actively following"
+    flavor of ``locked`` (see module docstring above) — this keeps the chip
+    honest about severity ordering instead of re-deriving it per state.
+    """
+    hidden = {"visible": False, "text": "", "color_key": "idle"}
+    if not _tracking_enabled(rec):
+        return hidden
+    status = _tracking_status(rec)
+    state = str(status.get("state", "") or "")
+    if not state or state == "idle":
+        return hidden
+    action = str(status.get("action", "") or "")
+    severity = str(status.get("severity", "info") or "info")
+
+    if state == "locked" and action == "paused":
+        text = "SELECTED"
+        color_key = "neutral"
+    else:
+        text = _STATE_CHIP_TEXT.get(state, state.upper())
+        color_key = _SEVERITY_COLOR_KEY.get(severity, "neutral")
+    return {"visible": True, "text": text, "color_key": color_key}
+
+
+def quality_multiplier(effective: int, configured: int) -> int:
+    """Round the effective/configured detect-interval ratio to a whole ×N step.
+
+    Shared by the tile's degradation chip and the properties panel's
+    "Degraded ×N" row so the two surfaces can never disagree about the
+    multiplier they show for the same telemetry. Matches the auto quality
+    ladder's ×2/×4 steps (floor of the ratio, never below ×2 — callers only
+    invoke this once they've already established ``effective > configured``).
+    """
+    return max(2, effective // configured)
+
+
+def _degradation_chip_info(rec: Any) -> dict[str, Any]:
+    """Resolve the tile's quality-degradation chip: ``{visible, text, tooltip}``.
+
+    Visible only once the effective detector cadence has actually stretched
+    past the configured value (the auto quality ladder engaged); hidden at the
+    configured cadence so the chip never claims a degradation that isn't real.
+    """
+    hidden = {"visible": False, "text": "", "tooltip": ""}
+    q = _quality_state(rec)
+    configured = int(q.get("configured_interval", 1) or 1)
+    effective = int(q.get("detect_interval", configured) or configured)
+    if configured <= 0 or effective <= configured:
+        return hidden
+    multiplier = quality_multiplier(effective, configured)
+    return {
+        "visible": True,
+        "text": f"×{multiplier}",
+        "tooltip": str(q.get("reason", "") or ""),
+    }
+
+
 def _ignore_arms(rec: Any) -> bool:
     """True when the camera's aim body mode ignores arms ("torso")."""
     try:

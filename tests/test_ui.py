@@ -298,6 +298,221 @@ class TestCameraTileFramingHelpers:
             tile.deleteLater()
 
 
+class TestStateChips:
+    """R-6: tracking-state + degradation chips (pure helpers, no paint needed).
+
+    ``_state_chip_info`` / ``_degradation_chip_info`` are the display-only
+    resolvers the tile's paintEvent calls; testing them directly asserts on
+    widget *state* (chip text/color/visibility), not pixels, per the project's
+    offscreen-Qt UI test convention.
+    """
+
+    def _rec(
+        self, camera_id: str = "cam-1", *, tracking_enabled: bool = True, detect_interval: int = 1
+    ):
+        from autoptz.config.models import CameraConfig, SourceConfig, TrackingConfig
+        from autoptz.ui.engine_client import CameraRecord
+
+        cfg = CameraConfig(
+            id=camera_id,
+            name="Cam",
+            source=SourceConfig(type="synthetic", address="anim"),
+            tracking=TrackingConfig(detect_interval=detect_interval),
+        )
+        rec = CameraRecord(
+            camera_id,
+            "synthetic://anim",
+            "Cam",
+            camera_config=cfg,
+            tracking_enabled=tracking_enabled,
+        )
+        return rec
+
+    # (a) each tracking_state -> correct chip text/color -----------------------
+    #
+    # Pinned vocabulary: the full literal ``(state, action, severity)`` set
+    # emitted by ``_tracking_status_info`` (autoptz/engine/camera_worker.py).
+    # ``locked`` and ``standby`` each have two ``action`` flavors that must
+    # render differently even though ``state`` is identical:
+    #   - locked+tracking (severity=ok) is the only state that gets the green
+    #     "actively following" chip; locked+paused (severity=info) must NOT
+    #     read as active tracking (target picked, auto-tracking toggle off).
+    #   - standby+confirming fires on *every* fresh target pick (worker sets
+    #     ``_target_lock.status="pending"`` unconditionally in
+    #     ``_commit_target_track``) — this used to render red LOST, which
+    #     falsely alarmed on ordinary acquisition. standby+standby is the
+    #     terminal "gave up waiting to reacquire" fallback. Both are
+    #     severity=info and must render amber-at-most (neutral here), never red.
+    # Severity->color: ok->green ("locked"), warning->amber ("warning"),
+    # info->neutral/gray ("neutral"). Nothing in this table is red/"error" —
+    # the engine never emits severity="error" from this function.
+    @pytest.mark.parametrize(
+        ("state", "action", "severity", "color_key", "text"),
+        [
+            ("locked", "tracking", "ok", "locked", "LOCKED"),
+            ("locked", "paused", "info", "neutral", "SELECTED"),
+            ("coasting", "holding", "warning", "warning", "COASTING"),
+            ("searching", "zooming_out", "warning", "warning", "SEARCHING"),
+            ("ambiguous", "holding", "warning", "warning", "AMBIGUOUS"),
+            ("manual", "manual", "warning", "warning", "MANUAL"),
+            ("degraded", "holding", "warning", "warning", "DEGRADED"),
+            # Fresh target pick — the critical regression case (used to be red).
+            ("standby", "confirming", "info", "neutral", "STANDBY"),
+            # Coast window elapsed, waiting to reacquire.
+            ("standby", "standby", "info", "neutral", "STANDBY"),
+        ],
+    )
+    def test_state_chip_maps_each_tracking_state(
+        self, qapp, state, action, severity, color_key, text
+    ) -> None:
+        from autoptz.engine.runtime.messages import TelemetryMsg, TrackingStatusInfo
+        from autoptz.ui.widgets.tile_helpers import _state_chip_info
+
+        rec = self._rec()
+        rec.telemetry = TelemetryMsg(
+            camera_id="cam-1",
+            seq=0,
+            tracking_status=TrackingStatusInfo(state=state, action=action, severity=severity),
+        )
+        info = _state_chip_info(rec)
+        assert info["visible"] is True
+        assert info["color_key"] == color_key
+        assert info["text"] == text
+        # The mandatory non-alarming guard: nothing in the pinned vocabulary
+        # is ever "error"/red — the engine has no severity="error" state and
+        # no literal "lost" state (only an internal lock status that always
+        # folds onto one of the "standby" flavors above).
+        assert color_key != "error"
+
+    def test_unknown_future_state_falls_back_to_neutral_not_red(self, qapp) -> None:
+        """A state the engine might add later must never default to red/alarming.
+
+        ``_SEVERITY_COLOR_KEY`` only recognizes ok/warning/info; an
+        unrecognized severity (or a state string with no dedicated label)
+        must fail safe to the neutral color, matching the module's
+        back-compat/forward-compat contract.
+        """
+        from autoptz.engine.runtime.messages import TelemetryMsg, TrackingStatusInfo
+        from autoptz.ui.widgets.tile_helpers import _state_chip_info
+
+        rec = self._rec()
+        rec.telemetry = TelemetryMsg(
+            camera_id="cam-1",
+            seq=0,
+            tracking_status=TrackingStatusInfo(
+                state="some_future_state", action="", severity="some_future_severity"
+            ),
+        )
+        info = _state_chip_info(rec)
+        assert info["visible"] is True
+        assert info["color_key"] == "neutral"
+        assert info["text"] == "SOME_FUTURE_STATE"
+
+    def test_state_chip_hidden_when_idle(self, qapp) -> None:
+        from autoptz.engine.runtime.messages import TelemetryMsg, TrackingStatusInfo
+        from autoptz.ui.widgets.tile_helpers import _state_chip_info
+
+        rec = self._rec()
+        rec.telemetry = TelemetryMsg(
+            camera_id="cam-1", seq=0, tracking_status=TrackingStatusInfo(state="idle")
+        )
+        assert _state_chip_info(rec)["visible"] is False
+
+    # (b) degradation chip: effective > configured -> visible w/ multiplier ----
+
+    def test_degradation_chip_visible_with_multiplier_when_ladder_engaged(self, qapp) -> None:
+        from autoptz.engine.runtime.messages import QualityStateInfo, TelemetryMsg
+        from autoptz.ui.widgets.tile_helpers import _degradation_chip_info
+
+        rec = self._rec(detect_interval=1)
+        rec.telemetry = TelemetryMsg(
+            camera_id="cam-1",
+            seq=0,
+            quality_state=QualityStateInfo(
+                active="low", reason="CPU pressure >= 85%.", detect_interval=4
+            ),
+        )
+        info = _degradation_chip_info(rec)
+        assert info["visible"] is True
+        assert info["text"] == "×4"
+        assert "CPU pressure" in info["tooltip"]
+
+    def test_degradation_chip_hidden_at_configured_cadence(self, qapp) -> None:
+        from autoptz.engine.runtime.messages import QualityStateInfo, TelemetryMsg
+        from autoptz.ui.widgets.tile_helpers import _degradation_chip_info
+
+        rec = self._rec(detect_interval=2)
+        rec.telemetry = TelemetryMsg(
+            camera_id="cam-1",
+            seq=0,
+            quality_state=QualityStateInfo(active="high", detect_interval=2),
+        )
+        assert _degradation_chip_info(rec)["visible"] is False
+
+    # (c) tracking feature off for this camera -> state chip hidden ------------
+
+    def test_state_chip_hidden_when_tracking_disabled_for_camera(self, qapp) -> None:
+        from autoptz.engine.runtime.messages import TelemetryMsg, TrackingStatusInfo
+        from autoptz.ui.widgets.tile_helpers import _state_chip_info
+
+        rec = self._rec(tracking_enabled=False)
+        rec.telemetry = TelemetryMsg(
+            camera_id="cam-1", seq=0, tracking_status=TrackingStatusInfo(state="locked")
+        )
+        assert _state_chip_info(rec)["visible"] is False
+
+    # (e) old-style telemetry (fields absent/default) -> no crash, hidden ------
+
+    def test_chips_hidden_with_bare_default_telemetry(self, qapp) -> None:
+        from autoptz.engine.runtime.messages import TelemetryMsg
+        from autoptz.ui.widgets.tile_helpers import _degradation_chip_info, _state_chip_info
+
+        rec = self._rec()
+        rec.telemetry = TelemetryMsg(camera_id="cam-1", seq=0)  # every optional field defaults
+        assert _state_chip_info(rec)["visible"] is False
+        assert _degradation_chip_info(rec)["visible"] is False
+
+    def test_chips_hidden_with_no_telemetry_at_all(self, qapp) -> None:
+        from autoptz.ui.widgets.tile_helpers import _degradation_chip_info, _state_chip_info
+
+        rec = self._rec()
+        assert rec.telemetry is None
+        assert _state_chip_info(rec)["visible"] is False
+        assert _degradation_chip_info(rec)["visible"] is False
+
+    # tile actually paints the chips (widget-level smoke, offscreen) -----------
+
+    def test_tile_paints_without_error_when_state_and_degradation_chips_active(self, qapp) -> None:
+        from autoptz.engine.runtime.messages import (
+            QualityStateInfo,
+            TelemetryMsg,
+            TrackingStatusInfo,
+        )
+        from autoptz.ui.engine_client import EngineClient
+        from autoptz.ui.widgets.camera_tile import CameraTile
+
+        client = EngineClient()
+        rec = self._rec(detect_interval=1)
+        rec.telemetry = TelemetryMsg(
+            camera_id="cam-1",
+            seq=0,
+            tracking_status=TrackingStatusInfo(state="coasting"),
+            quality_state=QualityStateInfo(active="low", detect_interval=4),
+        )
+        client.cameraModel.add_camera(rec)
+        tile = CameraTile("cam-1", client, frame_source=None)
+        try:
+            # The tile must actually own paint methods for both chips (not just
+            # tolerate their absence) — proves the HUD is wired, not merely that
+            # painting doesn't crash without them.
+            assert hasattr(tile, "_paint_state_chip")
+            assert hasattr(tile, "_paint_degradation_chip")
+            tile.resize(320, 240)
+            tile.grab()  # forces paintEvent offscreen; must not raise
+        finally:
+            tile.deleteLater()
+
+
 class TestElideKeepingPct:
     """On-video labels must keep the trailing 'NN%' instead of eliding it away."""
 
@@ -400,6 +615,41 @@ class TestCameraRecord:
         out = rec.tracking_status_as_dict()
         assert out["headline"] == "Target lost - holding position"
         assert out["remaining_s"] == pytest.approx(0.7)
+
+    def test_quality_state_defaults_without_telemetry(self, qapp) -> None:
+        from autoptz.ui.engine_client import CameraRecord
+
+        rec = CameraRecord("id1", "usb://0", "Cam")
+        q = rec.quality_state_as_dict()
+        assert q["detect_interval"] == 1
+        assert q["configured_interval"] == 1
+
+    def test_quality_state_as_dict_carries_effective_interval_and_reason(self, qapp) -> None:
+        from autoptz.config.models import CameraConfig, SourceConfig, TrackingConfig
+        from autoptz.engine.runtime.messages import QualityStateInfo, TelemetryMsg
+        from autoptz.ui.engine_client import CameraRecord
+
+        cfg = CameraConfig(
+            id="id1",
+            name="Cam",
+            source=SourceConfig(type="synthetic", address="anim"),
+            tracking=TrackingConfig(detect_interval=1),
+        )
+        rec = CameraRecord("id1", "usb://0", "Cam", camera_config=cfg)
+        rec.telemetry = TelemetryMsg(
+            camera_id="id1",
+            seq=0,
+            quality_state=QualityStateInfo(
+                floor="auto",
+                active="low",
+                reason="Auto quality: over frame budget; detector cadence relaxed.",
+                detect_interval=4,
+            ),
+        )
+        q = rec.quality_state_as_dict()
+        assert q["detect_interval"] == 4
+        assert q["configured_interval"] == 1
+        assert "frame budget" in q["reason"]
 
     def test_tracks_emit_name_and_id_not_uuid(self, qapp) -> None:
         # Regression: the bbox/target label must show the display NAME, with the
@@ -1678,6 +1928,82 @@ finally:
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         result = _run_ui_smoke(code, cwd=Path(__file__).resolve().parents[1], env=env, timeout=30)
         assert result.returncode == 0, result.stderr or result.stdout
+
+
+class TestPropertiesPanelStateChips:
+    """R-6 (d): Camera Info / Tracking rows echo tracking state + degradation reason.
+
+    Reuses the panel's existing telemetry-driven refresh path
+    (``_on_telemetry`` → row ``setText``/``setVisible``), the same mechanism
+    ``_quality_effective``/``_detect_effective`` already use — no new refresh
+    wiring.
+    """
+
+    def test_tracking_state_and_reason_rows_reflect_telemetry(self, qapp, tmp_path) -> None:
+        from autoptz.config.store import ConfigStore
+        from autoptz.engine.runtime.messages import QualityStateInfo, TrackingStatusInfo
+        from autoptz.ui.engine_client import EngineClient
+        from autoptz.ui.frames import ShmFrameSource
+        from autoptz.ui.widgets.properties_panel import PropertiesPanel
+
+        client = EngineClient(store=ConfigStore(db_path=tmp_path / "cfg.db", debounce_s=0))
+        cid = client.addCamera("usb://0", "Cam")
+        panel = PropertiesPanel(client, frame_source=ShmFrameSource())
+        try:
+            panel.set_camera(cid)
+            rec = client.cameraModel.get_record(cid)
+            from autoptz.engine.runtime.messages import TelemetryMsg
+
+            rec.telemetry = TelemetryMsg(
+                camera_id=cid,
+                seq=1,
+                tracking_status=TrackingStatusInfo(
+                    state="coasting", headline="Target lost - holding position"
+                ),
+                quality_state=QualityStateInfo(
+                    active="low",
+                    reason="Auto quality: over frame budget; detector cadence relaxed.",
+                    detect_interval=4,
+                ),
+            )
+            panel._on_telemetry()
+
+            # ``_muted_captions`` rows follow the ``_quality_effective`` convention:
+            # ``setVisible(True/False)`` is the "shown" state the code controls.
+            # The row lives inside a collapsed-by-default CollapsibleGroup and the
+            # panel is never shown in this test, so ``isVisible()`` (which also
+            # requires the whole ancestor chain to be on-screen) is the wrong
+            # probe here — ``isHidden()`` reflects only this widget's own explicit
+            # hide/show state, which is exactly what ``_update_tracking_state_row``
+            # sets.
+            assert "coasting" in panel._track_state.text().lower()
+            assert not panel._track_state.isHidden()
+            assert "frame budget" in panel._track_reason.text()
+            assert not panel._track_reason.isHidden()
+        finally:
+            panel.deleteLater()
+
+    def test_tracking_state_row_hidden_when_idle(self, qapp, tmp_path) -> None:
+        from autoptz.config.store import ConfigStore
+        from autoptz.engine.runtime.messages import TelemetryMsg, TrackingStatusInfo
+        from autoptz.ui.engine_client import EngineClient
+        from autoptz.ui.frames import ShmFrameSource
+        from autoptz.ui.widgets.properties_panel import PropertiesPanel
+
+        client = EngineClient(store=ConfigStore(db_path=tmp_path / "cfg.db", debounce_s=0))
+        cid = client.addCamera("usb://0", "Cam")
+        panel = PropertiesPanel(client, frame_source=ShmFrameSource())
+        try:
+            panel.set_camera(cid)
+            rec = client.cameraModel.get_record(cid)
+            rec.telemetry = TelemetryMsg(
+                camera_id=cid, seq=1, tracking_status=TrackingStatusInfo(state="idle")
+            )
+            panel._on_telemetry()
+            assert panel._track_state.isHidden()
+            assert panel._track_state.text() == ""
+        finally:
+            panel.deleteLater()
 
 
 class TestCenterStageUI:
