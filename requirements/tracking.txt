@@ -31,6 +31,11 @@ boxmot==19.0.0
 # takes a numpy-2-compatible torch>=2.3. The >=2.3 floor matters: torch wheels
 # declare no numpy upper bound, so without it pip can pick an older torch and
 # pair it with numpy 2, an ABI mismatch that crashes at runtime.
+#
+# Repeat the numpy split here so this file is installable on its own
+# (`pip install -r requirements/tracking.txt`) without relying on base.txt.
+numpy==1.26.4; platform_system == "Darwin" and platform_machine == "x86_64"
+numpy==2.2.6; platform_system != "Darwin" or platform_machine != "x86_64"
 torch==2.2.2; platform_system == "Darwin" and platform_machine == "x86_64"
 torchvision==0.17.2; platform_system == "Darwin" and platform_machine == "x86_64"
 torch>=2.3,<3; platform_system != "Darwin" or platform_machine != "x86_64"
