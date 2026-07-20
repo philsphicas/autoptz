@@ -16,9 +16,11 @@
 # Pinned to 19.0.0: this is the newest release that both keeps the tracker API
 # engine/pipeline/track.py uses (`from boxmot.trackers import BotSort, ByteTrack,
 # DeepOcSort` with the reid_model / with_reid constructor) AND installs on every
-# target platform. 22.x moved those classes to boxmot.trackers.bbox.* (the import
-# breaks); 20.x/21.x keep the API but require numpy>=2.2, which has no compatible
+# target platform. In 22.x those classes are no longer importable from
+# `boxmot.trackers` (they now live in tracker-specific submodules like
+# `boxmot.trackers.botsort` / `bytetrack` / `deepocsort`), so this import path
+# breaks. 20.x/21.x keep the API but require numpy>=2.2, which has no compatible
 # torch wheel on x86_64 macOS (last Intel torch is 2.2.2, needs numpy<2). Revisit
-# when track.py adopts a newer boxmot API and the numpy/torch split below allows
-# raising this cap.
+# when track.py adopts the newer boxmot import layout and/or platform wheel
+# constraints change.
 boxmot==19.0.0
