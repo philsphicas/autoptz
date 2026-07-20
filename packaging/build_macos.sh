@@ -54,13 +54,38 @@ require_developer_id_signature() {
     fi
 }
 
+# codesign's --timestamp step contacts Apple's secure timestamp server, which
+# intermittently answers "The timestamp service is not available." — a transient
+# network flake, not a signing problem. A single build signs 200+ nested Mach-O
+# binaries, so even a low per-call failure rate reliably sinks a build (and, on
+# the release-gating arch, the whole cross-platform release). Retry only on that
+# flake, mirroring create_dmg's hdiutil retry; any other codesign error fails
+# fast so real problems aren't masked.
+codesign_with_retry() {
+    local attempt out
+    for (( attempt = 1; attempt <= 5; attempt++ )); do
+        if out="$(codesign "$@" 2>&1)"; then
+            [[ -n "${out}" ]] && printf '%s\n' "${out}"
+            return 0
+        fi
+        printf '%s\n' "${out}" >&2
+        if (( attempt < 5 )) && printf '%s' "${out}" | grep -qi "timestamp service is not available"; then
+            echo "!! codesign hit the timestamp-service flake (attempt ${attempt}/5) — retrying in $(( attempt * 5 ))s…" >&2
+            sleep "$(( attempt * 5 ))"
+            continue
+        fi
+        return 1
+    done
+    return 1
+}
+
 sign_macho_files() {
     local app="$1"
     local signed=0
     local candidate
     while IFS= read -r -d '' candidate; do
         if file -b "${candidate}" | grep -q "Mach-O"; then
-            codesign --force --options runtime --timestamp --sign "${SIGN_IDENTITY}" "${candidate}" \
+            codesign_with_retry --force --options runtime --timestamp --sign "${SIGN_IDENTITY}" "${candidate}" \
                 || { echo "!! codesign failed for ${candidate}"; exit 1; }
             signed=$((signed + 1))
         fi
@@ -200,7 +225,7 @@ if [[ -n "${SIGN_IDENTITY}" ]]; then
     # reports later as "not signed with a valid Developer ID certificate".
     sign_macho_files "${APP}"
     # Then the app bundle itself, carrying the entitlements.
-    codesign --force --options runtime --timestamp \
+    codesign_with_retry --force --options runtime --timestamp \
         --entitlements packaging/entitlements.plist \
         --sign "${SIGN_IDENTITY}" "${APP}"
     codesign --verify --deep --strict --verbose=2 "${APP}"
@@ -233,7 +258,7 @@ if [[ "${MAKE_DMG:-0}" == "1" ]]; then
     # Sign + notarize + staple the distributed .dmg (opt-in).
     if [[ -n "${SIGN_IDENTITY}" ]]; then
         echo "==> Codesigning ${DMG}"
-        codesign --force --timestamp --sign "${SIGN_IDENTITY}" "${DMG}"
+        codesign_with_retry --force --timestamp --sign "${SIGN_IDENTITY}" "${DMG}"
         echo "==> Signing authority on ${DMG}:"
         require_developer_id_signature "${DMG}"
         notarize_and_staple "${DMG}"
