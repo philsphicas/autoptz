@@ -22,3 +22,14 @@
 # when track.py adopts a newer boxmot API and the numpy/torch split below allows
 # raising this cap.
 boxmot==19.0.0
+
+# torch comes in transitively via boxmot, but pin it explicitly by platform so
+# the extra resolves on x86_64 macOS: the last Intel-mac torch wheel is 2.2.2
+# (which needs numpy<2, see the numpy split in base.txt). Every other platform
+# takes a numpy-2-compatible torch>=2.3. The >=2.3 floor matters: torch wheels
+# declare no numpy upper bound, so without it pip can pick an older torch and
+# pair it with numpy 2, an ABI mismatch that crashes at runtime.
+torch==2.2.2; platform_system == "Darwin" and platform_machine == "x86_64"
+torchvision==0.17.2; platform_system == "Darwin" and platform_machine == "x86_64"
+torch>=2.3,<3; platform_system != "Darwin" or platform_machine != "x86_64"
+torchvision>=0.18,<1; platform_system != "Darwin" or platform_machine != "x86_64"

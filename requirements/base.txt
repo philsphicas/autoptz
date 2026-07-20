@@ -16,7 +16,13 @@ onnxruntime==1.23.2; platform_system == "Darwin" and platform_machine == "x86_64
 onnxruntime==1.24.1; platform_system != "Darwin" or platform_machine != "x86_64"
 
 # ── computer vision ───────────────────────────────────────────────────────────
-numpy==2.2.6
+# numpy is split by platform so the optional tracking extra (torch, see
+# requirements/tracking.txt) can resolve on x86_64 macOS: the last Intel-mac
+# torch wheel is 2.2.2, which requires numpy<2. Every other platform keeps
+# numpy 2.2.6. The torch-free core works with either, so this only matters when
+# the tracking extra is added on an Intel Mac.
+numpy==1.26.4; platform_system == "Darwin" and platform_machine == "x86_64"
+numpy==2.2.6; platform_system != "Darwin" or platform_machine != "x86_64"
 opencv-contrib-python==4.11.0.86
 Pillow==12.2.0
 
