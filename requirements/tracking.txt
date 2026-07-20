@@ -12,5 +12,13 @@
 # Also provides the OSNet ReID backend used by engine/pipeline/reid.py for
 # body-appearance recovery after occlusion (weights auto-download on first use).
 # Optional at import time — Tracker / BodyReID degrade gracefully if absent.
-# Pin to a specific release once a stable wheel is available for all platforms.
-boxmot>=10.0.91
+#
+# Pinned to 19.0.0: this is the newest release that both keeps the tracker API
+# engine/pipeline/track.py uses (`from boxmot.trackers import BotSort, ByteTrack,
+# DeepOcSort` with the reid_model / with_reid constructor) AND installs on every
+# target platform. 22.x moved those classes to boxmot.trackers.bbox.* (the import
+# breaks); 20.x/21.x keep the API but require numpy>=2.2, which has no compatible
+# torch wheel on x86_64 macOS (last Intel torch is 2.2.2, needs numpy<2). Revisit
+# when track.py adopts a newer boxmot API and the numpy/torch split below allows
+# raising this cap.
+boxmot==19.0.0
