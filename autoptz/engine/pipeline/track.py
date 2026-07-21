@@ -48,6 +48,10 @@ log = logging.getLogger(__name__)
 
 # ── Optional BoxMOT probe ──────────────────────────────────────────────────────
 
+# Cached backend usability probe:
+# - None  => not probed yet
+# - True  => importable and currently considered usable
+# - False => unavailable (not installed) or previously detected incompatible
 _BOXMOT_AVAILABLE: bool | None = None
 
 
@@ -82,7 +86,12 @@ def _quiet_boxmot_logging() -> None:
 
 
 def boxmot_available() -> bool:
-    """Public capability probe: is the BoxMOT tracker backend importable?"""
+    """Public capability probe: can the BoxMOT backend be used right now?
+
+    This is a runtime usability flag, not a pure import probe: it returns False
+    when ``boxmot`` is missing *or* when tracker construction previously proved
+    the installed BoxMOT API is incompatible with this wrapper.
+    """
     return _probe_boxmot()
 
 
@@ -100,6 +109,23 @@ def _log_fallback_tracker_once() -> None:
         "boxmot not installed — using built-in lightweight IoU tracker "
         "(detection + boxes work; install boxmot for occlusion-robust BoT-SORT "
         "+ ReID re-acquisition).",
+    )
+
+
+# One-time guard for the "boxmot present but API incompatible" degrade path.
+_LOGGED_INCOMPATIBLE_BOXMOT = False
+
+
+def _log_incompatible_boxmot_once(exc: BaseException | None = None) -> None:
+    global _LOGGED_INCOMPATIBLE_BOXMOT
+    if _LOGGED_INCOMPATIBLE_BOXMOT:
+        return
+    _LOGGED_INCOMPATIBLE_BOXMOT = True
+    log.warning(
+        "boxmot is installed but its tracker API is incompatible — using the "
+        "built-in lightweight IoU tracker instead (detection + boxes still work). "
+        "Install a compatible boxmot release for occlusion-robust BoT-SORT + ReID.",
+        exc_info=exc,
     )
 
 
@@ -284,12 +310,23 @@ def _create_boxmot_tracker(
     ``reid_weights`` is optional for all trackers; if absent, appearance ReID is
     disabled (motion-only tracking) — the trackers still run on boxes alone.
 
-    When ``boxmot`` is not installed (or its API is incompatible) callers fall
-    back to the built-in :class:`_SimpleIoUTracker` so detection/tracking still
-    runs on a minimal install — it never hard-fails.
+    Degradation is graceful and never hard-fails:
+
+    - ``boxmot`` not installed → built-in :class:`_SimpleIoUTracker`.
+    - ``boxmot`` installed but its tracker API is incompatible (a major bump that
+      moved/renamed the classes, so not even a motion-only tracker builds) →
+      IoU tracker, logged once, and cached so the broken install isn't retried.
+    - ReID (the optional appearance model) fails but the tracker builds without
+      it → motion-only BoxMOT tracking.
     """
+    global _BOXMOT_AVAILABLE
     if not _probe_boxmot():
-        _log_fallback_tracker_once()
+        # Only emit the "not installed" line when boxmot is genuinely absent.
+        # If we already downgraded because an installed-but-incompatible API was
+        # detected, ``_probe_boxmot`` now returns False too — suppress the
+        # misleading fallback log so the earlier incompatibility warning stands.
+        if not _LOGGED_INCOMPATIBLE_BOXMOT:
+            _log_fallback_tracker_once()
         return _SimpleIoUTracker(max_age=max_age)
 
     buffer = int(max_age)
@@ -348,16 +385,37 @@ def _create_boxmot_tracker(
             )
 
     want_reid = reid_weights is not None
-    try:
-        tracker = _instantiate(want_reid)
-    except Exception:  # noqa: BLE001
-        if want_reid:
-            # ReID weights/download failed — fall back to motion-only so tracking
-            # still works (never let an optional appearance model kill tracking).
-            log.warning("ReID init failed; falling back to motion-only tracking.", exc_info=True)
-            tracker = _instantiate(False)
+
+    def _try_build(use_reid: bool) -> tuple[Any | None, BaseException | None]:
+        try:
+            return _instantiate(use_reid), None
+        except Exception as exc:  # noqa: BLE001
+            return None, exc
+
+    tracker, first_exc = _try_build(want_reid)
+    if tracker is None and want_reid:
+        # A failure with ReID enabled might just be the optional appearance model
+        # (weights download/load).  Retry motion-only: if that builds, the core
+        # tracker is fine and only ReID was the problem.
+        tracker, motion_exc = _try_build(False)
+        if tracker is not None:
+            log.warning(
+                "ReID init failed; falling back to motion-only tracking.",
+                exc_info=first_exc,
+            )
         else:
-            raise
+            # Motion-only failed too, so that exception is the one that proves
+            # the install is unusable — surface it rather than the ReID error.
+            first_exc = motion_exc
+    if tracker is None:
+        # Not even a motion-only tracker builds — this boxmot is unusable,
+        # typically a major version that moved/renamed the tracker API.  Degrade
+        # to the built-in IoU tracker and cache it so we stop retrying a broken
+        # install for the rest of the process.
+        _BOXMOT_AVAILABLE = False
+        _log_incompatible_boxmot_once(first_exc)
+        return _SimpleIoUTracker(max_age=max_age)
+
     # BoxMOT re-raises its logger to INFO during construction; re-silence it now
     # so the per-frame ECC warnings don't reach the console.
     _quiet_boxmot_logging()
