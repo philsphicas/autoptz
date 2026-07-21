@@ -6,6 +6,10 @@ so all state-machine and lifecycle logic can be tested with a plain mock.
 
 from __future__ import annotations
 
+import logging
+import sys
+import types
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -17,6 +21,7 @@ from autoptz.engine.pipeline.track import (
     Tracker,
     TrackerType,
     TrackState,
+    _create_boxmot_tracker,
     _probe_boxmot,
 )
 
@@ -270,6 +275,132 @@ class TestBoxMOTUnavailable:
             assert tracks2[0].track_id == first_id
         finally:
             track_mod._BOXMOT_AVAILABLE = orig
+
+
+def _install_fake_boxmot(monkeypatch: pytest.MonkeyPatch, trackers: dict[str, type]) -> None:
+    """Install a fake ``boxmot`` package exposing *trackers* (name -> class)
+    under ``boxmot.trackers``.
+
+    Names absent from *trackers* make ``from boxmot.trackers import BotSort,
+    ByteTrack, DeepOcSort`` raise ImportError and the legacy top-level
+    ``boxmot.<Name>`` access raise AttributeError — mirroring a major boxmot bump
+    that moved/renamed the tracker classes.
+    """
+    boxmot_mod = types.ModuleType("boxmot")
+    boxmot_mod.__path__ = []  # mark as a package so submodule imports resolve
+    trackers_mod = types.ModuleType("boxmot.trackers")
+    for name, cls in trackers.items():
+        setattr(trackers_mod, name, cls)
+    boxmot_mod.trackers = trackers_mod
+    monkeypatch.setitem(sys.modules, "boxmot", boxmot_mod)
+    monkeypatch.setitem(sys.modules, "boxmot.trackers", trackers_mod)
+
+
+class TestBoxMOTIncompatibleFallback:
+    """An installed-but-unusable boxmot, and ReID-only failures, must degrade
+    gracefully instead of crashing on the first tracked frame."""
+
+    @staticmethod
+    def _arm(monkeypatch: pytest.MonkeyPatch):
+        """Pretend boxmot is importable and reset the one-time log guards.
+
+        Everything is set via monkeypatch so the module globals are restored
+        after the test and can't leak into others (pytest doesn't guarantee
+        execution order)."""
+        import autoptz.engine.pipeline.track as track_mod
+
+        monkeypatch.setattr(track_mod, "_BOXMOT_AVAILABLE", True)
+        monkeypatch.setattr(track_mod, "_LOGGED_INCOMPATIBLE_BOXMOT", False)
+        monkeypatch.setattr(track_mod, "_LOGGED_FALLBACK_TRACKER", False)
+        return track_mod
+
+    def test_missing_classes_degrade_to_iou(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        track_mod = self._arm(monkeypatch)
+        _install_fake_boxmot(monkeypatch, {})  # no tracker classes anywhere
+
+        with caplog.at_level(logging.WARNING, logger=track_mod.__name__):
+            tracker = _create_boxmot_tracker(
+                TrackerType.BYTETRACK, reid_weights=None, device="cpu", fps=30.0, max_age=30
+            )
+
+        assert isinstance(tracker, track_mod._SimpleIoUTracker)
+        assert track_mod._BOXMOT_AVAILABLE is False
+        assert any("tracker API is incompatible" in r.message for r in caplog.records)
+        assert not any("ReID init failed" in r.message for r in caplog.records)
+
+    def test_missing_classes_with_reid_degrade_to_iou(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        track_mod = self._arm(monkeypatch)
+        _install_fake_boxmot(monkeypatch, {})
+
+        tracker = _create_boxmot_tracker(
+            TrackerType.BOTSORT,
+            reid_weights=Path("/nonexistent-osnet.pt"),
+            device="cpu",
+            fps=30.0,
+            max_age=30,
+        )
+
+        assert isinstance(tracker, track_mod._SimpleIoUTracker)
+        assert track_mod._BOXMOT_AVAILABLE is False
+
+    def test_reid_failure_falls_back_to_motion_only(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        track_mod = self._arm(monkeypatch)
+
+        class _BotSort:
+            def __init__(self, *args, with_reid: bool = False, **kwargs) -> None:
+                if with_reid:
+                    raise RuntimeError("osnet weights download failed")
+                self.with_reid = with_reid
+
+        _install_fake_boxmot(
+            monkeypatch, {"BotSort": _BotSort, "ByteTrack": _BotSort, "DeepOcSort": _BotSort}
+        )
+
+        with caplog.at_level(logging.WARNING, logger=track_mod.__name__):
+            tracker = _create_boxmot_tracker(
+                TrackerType.BOTSORT,
+                reid_weights=Path("/some-osnet.pt"),
+                device="cpu",
+                fps=30.0,
+                max_age=30,
+            )
+
+        # Falls back to a real (motion-only) boxmot tracker, not the IoU tracker.
+        assert isinstance(tracker, _BotSort)
+        assert tracker.with_reid is False
+        # A ReID hiccup is not a broken install, so the backend stays usable.
+        assert track_mod._BOXMOT_AVAILABLE is True
+        assert any("ReID init failed" in r.message for r in caplog.records)
+        assert not any("tracker API is incompatible" in r.message for r in caplog.records)
+
+    def test_cached_incompatibility_suppresses_not_installed_log(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        track_mod = self._arm(monkeypatch)
+        _install_fake_boxmot(monkeypatch, {})
+
+        first = _create_boxmot_tracker(
+            TrackerType.BYTETRACK, reid_weights=None, device="cpu", fps=30.0, max_age=30
+        )
+        assert isinstance(first, track_mod._SimpleIoUTracker)
+        # Cached so a broken install isn't retried for the rest of the process.
+        assert track_mod._BOXMOT_AVAILABLE is False
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=track_mod.__name__):
+            second = _create_boxmot_tracker(
+                TrackerType.BYTETRACK, reid_weights=None, device="cpu", fps=30.0, max_age=30
+            )
+
+        assert isinstance(second, track_mod._SimpleIoUTracker)
+        # After a cached incompatibility, later calls must not emit the
+        # misleading "boxmot not installed" line.
+        assert not any("boxmot not installed" in r.message for r in caplog.records)
+        assert track_mod._LOGGED_FALLBACK_TRACKER is False
 
 
 # ── Edge cases ─────────────────────────────────────────────────────────────────
